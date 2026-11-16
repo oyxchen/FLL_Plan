@@ -26,7 +26,6 @@ function mergeState(value: unknown): SiteState {
 }
 
 function uid() { return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`; }
-function fileData(file: File) { return new Promise<string>((resolve, reject) => { const reader = new FileReader(); reader.onerror = () => reject(new Error("Could not read that file.")); reader.onload = () => resolve(String(reader.result)); reader.readAsDataURL(file); }); }
 function googleId(url: string) { return url.match(/\/d\/([\w-]+)/)?.[1] || new URL(url).searchParams.get("id") || ""; }
 function googleEmbed(resource: Resource) {
   try {
@@ -84,6 +83,7 @@ export default function FLLPlan() {
   const [hydrated, setHydrated] = useState(false);
   const [cloud, setCloud] = useState(false);
   const [syncMessage, setSyncMessage] = useState("");
+  const [storageError, setStorageError] = useState("");
   const [passcode, setPasscode] = useState("");
   const [loginError, setLoginError] = useState("");
   const [busy, setBusy] = useState(false);
@@ -111,36 +111,34 @@ export default function FLLPlan() {
   const [today] = useState(() => new Date());
   const dirty = useRef(false);
   const stateRef = useRef(state);
+  const remindedEvents = useRef(new Set<string>());
   const fileInput = useRef<HTMLInputElement>(null);
   stateRef.current = state;
 
   useEffect(() => {
-    const saved = localStorage.getItem("fll-plan-state-v1");
-    if (saved) { try { setState(mergeState(JSON.parse(saved))); } catch { /* Start with the default state if local data is damaged. */ } }
     if ("Notification" in window) setNotificationPermission(Notification.permission);
     fetch("/api/state", { cache: "no-store" }).then(async response => {
       if (response.status === 401) return;
-      if (response.status === 503) { setUnlocked(true); setCloud(false); return; }
-      if (response.ok) {
-        const payload = await response.json();
-        setCloud(Boolean(payload.configured));
-        if (payload.state) setState(mergeState(payload.state));
-        setUnlocked(true);
-      }
-    }).catch(() => {}).finally(() => setHydrated(true));
+      if (response.status === 503) { setStorageError("Shared storage is not connected. Set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY in Vercel, then run the Supabase SQL in README.md."); return; }
+      if (!response.ok) throw new Error("Could not connect to the shared team database.");
+      const payload = await response.json();
+      if (!payload.configured) { setStorageError("Shared storage is not connected. Set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY in Vercel, then run the Supabase SQL in README.md."); return; }
+      setCloud(true);
+      if (payload.state) setState(mergeState(payload.state));
+      setUnlocked(true);
+    }).catch(() => setStorageError("Could not connect to the shared team database. Check the Vercel and Supabase settings.")).finally(() => setHydrated(true));
   }, []);
 
   useEffect(() => {
     if (!unlocked || !hydrated) return;
-    localStorage.setItem("fll-plan-state-v1", JSON.stringify(state));
     if (!cloud) return;
     const timer = window.setTimeout(async () => {
       try {
         const response = await fetch("/api/state", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ state }) });
         if (!response.ok) throw new Error("Cloud save failed; local backup is still saved.");
         dirty.current = false;
-        setSyncMessage("All changes saved");
-      } catch (error) { setSyncMessage(error instanceof Error ? error.message : "Cloud sync paused"); }
+        setSyncMessage("");
+      } catch (error) { setSyncMessage(error instanceof Error ? error.message : "Could not save changes to the team database."); }
     }, 650);
     return () => window.clearTimeout(timer);
   }, [state, unlocked, hydrated, cloud]);
@@ -178,10 +176,10 @@ export default function FLLPlan() {
       if (!todays.length) return;
       setReminder(`${todays.length} team ${todays.length === 1 ? "event" : "events"} today: ${todays.map(item => item.title).join(", ")}`);
       if ("Notification" in window && Notification.permission === "granted") {
-        const key = `fll-plan-reminded-${date}`;
-        const sent = JSON.parse(localStorage.getItem(key) || "[]") as string[];
-        todays.filter(item => !sent.includes(item.id)).forEach(item => new Notification(item.title, { body: item.description || "A team event is happening today.", icon: "/icon.svg" }));
-        localStorage.setItem(key, JSON.stringify([...new Set([...sent, ...todays.map(item => item.id)])]));
+        todays.filter(item => !remindedEvents.current.has(`${date}:${item.id}`)).forEach(item => {
+          new Notification(item.title, { body: item.description || "A team event is happening today.", icon: "/icon.svg" });
+          remindedEvents.current.add(`${date}:${item.id}`);
+        });
       }
     };
     check();
@@ -195,10 +193,12 @@ export default function FLLPlan() {
       const response = await fetch("/api/login", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ password: passcode }) });
       if (!response.ok) throw new Error("That passcode didn’t match. Try again.");
       const cloudResponse = await fetch("/api/state", { cache: "no-store" });
-      if (cloudResponse.ok) {
-        const payload = await cloudResponse.json();
-        if (payload.configured) { setCloud(true); if (payload.state) setState(mergeState(payload.state)); }
-      } else if (cloudResponse.status === 503) { setCloud(false); }
+      if (cloudResponse.status === 503) throw new Error("Shared storage is not connected. Set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY in Vercel, then run the Supabase SQL in README.md.");
+      if (!cloudResponse.ok) throw new Error("Could not connect to the shared team database.");
+      const payload = await cloudResponse.json();
+      if (!payload.configured) throw new Error("Shared storage is not connected. Set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY in Vercel, then run the Supabase SQL in README.md.");
+      setCloud(true); setStorageError("");
+      if (payload.state) setState(mergeState(payload.state));
       setUnlocked(true); setPasscode("");
     } catch (error) { setLoginError(error instanceof Error ? error.message : "Couldn’t sign in."); }
     finally { setBusy(false); }
@@ -216,22 +216,15 @@ export default function FLLPlan() {
     e.preventDefault(); setResourceError("");
     if (!newTitle.trim()) { setResourceError("Add a title for this resource."); return; }
     try {
+      if (!cloud) throw new Error("Shared server storage is not connected. Resource changes were not saved.");
       let resource: Resource;
       if (selectedFile) {
         if (selectedFile.size > 25 * 1024 * 1024) throw new Error("Files must be 25 MB or smaller.");
-        if (cloud) {
-          const form = new FormData(); form.append("file", selectedFile);
-          const upload = await fetch("/api/upload", { method: "POST", body: form });
-          const result = await upload.json();
-          if (!upload.ok) throw new Error(result.error || "Could not upload that file.");
-          resource = { id: uid(), title: newTitle.trim(), description: newDescription.trim(), kind: newKind, name: result.name, mime: result.mime, size: result.size, filePath: result.path };
-        } else {
-          if (selectedFile.size > 1_250_000) throw new Error("For a local-only site, use a file under 1.25 MB. Configure cloud storage for larger files.");
-          const dataUrl = await fileData(selectedFile);
-          let textContent: string | undefined;
-          if (/^(text\/|application\/(json|javascript|xml))/.test(selectedFile.type) || /\.(txt|md|json|py|js|csv)$/i.test(selectedFile.name)) textContent = await selectedFile.text();
-          resource = { id: uid(), title: newTitle.trim(), description: newDescription.trim(), kind: newKind, name: selectedFile.name, mime: selectedFile.type || "application/octet-stream", size: selectedFile.size, dataUrl, textContent };
-        }
+        const form = new FormData(); form.append("file", selectedFile);
+        const upload = await fetch("/api/upload", { method: "POST", body: form });
+        const result = await upload.json();
+        if (!upload.ok) throw new Error(result.error || "Could not upload that file.");
+        resource = { id: uid(), title: newTitle.trim(), description: newDescription.trim(), kind: newKind, name: result.name, mime: result.mime, size: result.size, filePath: result.path };
       } else {
         if (!driveUrl.trim()) throw new Error("Choose a file to upload or paste a Google Drive link.");
         const parsed = new URL(driveUrl.trim());
@@ -251,6 +244,7 @@ export default function FLLPlan() {
 
   async function addCode(e: ChangeEvent<HTMLInputElement>) {
     const file = e.target.files?.[0]; if (!file) return; setCodeError("");
+    if (!cloud) { setCodeError("Shared server storage is not connected. Code was not saved."); e.target.value = ""; return; }
     const run = Number(codeRun);
     const missionNumbers = codeMissions.split(/[\s,]+/).filter(Boolean).map(Number);
     if (!file.name.toLowerCase().endsWith(".py")) { setCodeError("Only .py Python files can be added."); e.target.value = ""; return; }
@@ -262,17 +256,11 @@ export default function FLLPlan() {
     const title = `run ${run}, mission${uniqueMissions.length > 1 ? "s" : ""} ${missionLabel}`;
     const name = `${title}.py`;
     try {
-      let item: CodeItem;
-      if (cloud) {
-        const renamedFile = new File([file], name, { type: file.type || "text/x-python" });
-        const form = new FormData(); form.append("file", renamedFile);
-        const response = await fetch("/api/upload", { method: "POST", body: form }); const result = await response.json();
-        if (!response.ok) throw new Error(result.error || "Upload failed.");
-        item = { id: uid(), title, name, mime: file.type || "text/x-python", size: file.size, filePath: result.path };
-      } else {
-        if (file.size > 1_250_000) throw new Error("For local-only use, code files must be under 1.25 MB.");
-        item = { id: uid(), title, name, mime: file.type || "text/x-python", size: file.size, dataUrl: await fileData(file) };
-      }
+      const renamedFile = new File([file], name, { type: file.type || "text/x-python" });
+      const form = new FormData(); form.append("file", renamedFile);
+      const response = await fetch("/api/upload", { method: "POST", body: form }); const result = await response.json();
+      if (!response.ok) throw new Error(result.error || "Upload failed.");
+      const item: CodeItem = { id: uid(), title, name, mime: file.type || "text/x-python", size: file.size, filePath: result.path };
       mutate(current => ({ ...current, code: [...current.code, item] }));
       setCodeRun(""); setCodeMissions("");
     } catch (error) { setCodeError(error instanceof Error ? error.message : "Could not add that code file."); }
@@ -332,7 +320,7 @@ export default function FLLPlan() {
 
   if (!hydrated) return <div className="screen-loader"><div className="loading-mark">F</div><span>Warming up the team hub…</span></div>;
 
-  if (!unlocked) return <main className="login-screen"><div className="login-orbit orbit-one"/><div className="login-orbit orbit-two"/><section className="login-card"><img className="login-bio" src={bioglowLogo} alt="FIRST LEGO League BIOGLOW"/><LogoMark/><p className="eyebrow">TEAM 75798 · SHARKBYTES</p><h1>A little progress<br/><em>adds up.</em></h1><p className="login-copy">Your team workspace is ready when you are.</p><form onSubmit={login}><label htmlFor="team-passcode">Team passcode</label><input id="team-passcode" type="password" inputMode="numeric" value={passcode} onChange={e => setPasscode(e.target.value)} placeholder="Enter your passcode" autoComplete="current-password" required/><button className="primary-button full-button" disabled={busy}>{busy ? "Opening your workspace…" : "Enter FLL Plan ↗"}</button></form>{loginError && <p className="form-error">{loginError}</p>}<p className="login-foot">One shared space for big ideas and small wins.</p></section></main>;
+  if (!unlocked) return <main className="login-screen"><div className="login-orbit orbit-one"/><div className="login-orbit orbit-two"/><section className="login-card"><img className="login-bio" src={bioglowLogo} alt="FIRST LEGO League BIOGLOW"/><LogoMark/><p className="eyebrow">TEAM 75798 · SHARKBYTES</p><h1>A little progress<br/><em>adds up.</em></h1><p className="login-copy">Your team workspace is ready when you are.</p><form onSubmit={login}><label htmlFor="team-passcode">Team passcode</label><input id="team-passcode" type="password" inputMode="numeric" value={passcode} onChange={e => setPasscode(e.target.value)} placeholder="Enter your passcode" autoComplete="current-password" required/><button className="primary-button full-button" disabled={busy}>{busy ? "Opening your workspace…" : "Enter FLL Plan ↗"}</button></form>{(loginError || storageError) && <p className="form-error">{loginError || storageError}</p>}<p className="login-foot">One shared space for big ideas and small wins.</p></section></main>;
 
   return <div className="app-shell">
     <header className="topbar">
@@ -345,6 +333,7 @@ export default function FLLPlan() {
         <div className="content-wrap">
           <div className="page-heading"><div><div className="breadcrumb"><span>TEAM WORKSPACE</span><b>·</b><strong>{tabs.find(tab => tab.id === activeTab)?.label}</strong></div><h1>{activeTab === "resources" ? "Everything in one place." : activeTab === "presentation" ? "Tell the story." : activeTab === "robot" ? "Make every run count." : activeTab === "innovation" ? "Ideas into impact." : "Better, together."}</h1><p>{activeTab === "resources" ? "The notes, files, and inspiration behind your next big idea." : activeTab === "presentation" ? "Shape your story, one checklist item at a time." : activeTab === "robot" ? "Track your runs, tune your code, celebrate each point." : activeTab === "innovation" ? "Give your next great idea a little room to grow." : "The best teams make space for every voice."}</p></div><div className="heading-sparkle" aria-hidden="true">✳</div></div>
           {reminder && <div className="reminder-banner"><span>☀</span><div><b>Today on the team calendar</b><small>{reminder}</small></div><button className="icon-button" onClick={() => setReminder("")}>×</button></div>}
+          {syncMessage && <div className="storage-warning" role="status">{syncMessage}</div>}
 
           {activeTab === "resources" && <section className="tab-content">
             <div className="section-heading-row"><div><p className="eyebrow">TEAM LIBRARY</p><h2>Resource shelf <span className="count-chip">{state.resources.length}</span></h2></div></div>

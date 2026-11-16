@@ -9,7 +9,7 @@ npm install
 npm run dev
 ```
 
-Open `http://localhost:3000` and use the team passcode `75798`. With no cloud credentials, the app runs in local mode and saves data in that browser. Local uploads are limited to 1.25 MB per file so the browser can keep its backup safely.
+Open `http://localhost:3000` and use the team passcode `75798`. Supabase must be configured before the workspace opens. Team records and uploaded files are stored server-side in Supabase; the browser is not used to persist team data.
 
 ## Shared Vercel + Supabase setup
 
